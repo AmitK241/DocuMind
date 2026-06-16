@@ -89,19 +89,25 @@ def load_and_split(pdf_path: str) -> list:
 
 # ── Vector store ──────────────────────────────────────────────────────────────
 def build_vectorstore(chunks: list, collection_name: str = "default") -> Chroma:
-    return Chroma.from_documents(
+    import shutil, os
+    # Each PDF gets its own subdirectory to avoid collection conflicts
+    store_dir = os.path.join(CHROMA_DIR, collection_name)
+    if os.path.exists(store_dir):
+        shutil.rmtree(store_dir)
+    vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=_get_embeddings(),
-        persist_directory=CHROMA_DIR,
-        collection_name=collection_name,
+        persist_directory=store_dir,
     )
+    return vectorstore
 
 
 def load_vectorstore(collection_name: str = "default") -> Chroma:
+    import os
+    store_dir = os.path.join(CHROMA_DIR, collection_name)
     return Chroma(
-        persist_directory=CHROMA_DIR,
+        persist_directory=store_dir,
         embedding_function=_get_embeddings(),
-        collection_name=collection_name,
     )
 
 
