@@ -21,6 +21,21 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
+
+# ── Secret resolution (local .env  →  Streamlit Cloud secrets) ────────────────
+def _get_secret(key: str) -> str | None:
+    """Read a secret from the environment first, then from st.secrets.
+    Works both locally (via .env / shell env) and on Streamlit Cloud.
+    """
+    value = os.getenv(key)
+    if value:
+        return value
+    try:
+        import streamlit as st
+        return st.secrets.get(key)
+    except Exception:
+        return None
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 CHROMA_DIR          = "./chroma_db"
 GROQ_MODEL          = "llama-3.3-70b-versatile"
@@ -40,7 +55,7 @@ except ImportError:
 def get_groq_llm(temperature: float = 0.3) -> ChatGroq:
     return ChatGroq(
         model=GROQ_MODEL,
-        api_key=os.getenv("GROQ_API_KEY"),
+        api_key=_get_secret("GROQ_API_KEY"),
         temperature=temperature,
         max_tokens=1024,
     )
@@ -231,7 +246,7 @@ def _is_pdf_question(vectorstore, question: str) -> tuple:
 
 # ── Web search ────────────────────────────────────────────────────────────────
 def _web_search(query: str, max_results: int = 4) -> list:
-    key = os.getenv("TAVILY_API_KEY")
+    key = _get_secret("TAVILY_API_KEY")
     if not key:
         return []
     try:
@@ -298,7 +313,7 @@ def ask(chain, question: str, chat_history: list = None, vectorstore=None) -> di
 
         if used_web:
             mode = "web"
-        elif web_attempted and not os.getenv("TAVILY_API_KEY"):
+        elif web_attempted and not _get_secret("TAVILY_API_KEY"):
             mode = "web_no_key"
         elif web_attempted:
             mode = "web_failed"

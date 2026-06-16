@@ -19,6 +19,22 @@ from rag import (
     summarise_pdf,
 )
 
+
+# ── Secret resolution (local .env  →  Streamlit Cloud secrets) ────────────────
+def _get_secret(key: str) -> str | None:
+    """Check os.environ first, then st.secrets (Streamlit Cloud)."""
+    value = os.getenv(key)
+    if value:
+        return value
+    try:
+        return st.secrets.get(key)
+    except Exception:
+        return None
+
+
+GROQ_API_KEY   = _get_secret("GROQ_API_KEY")
+TAVILY_API_KEY = _get_secret("TAVILY_API_KEY")
+
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="DocuMind",
@@ -367,7 +383,7 @@ def _render_warning(mode: str):
             "<div class='warn-card'>⚠️ This needs web search but <code>TAVILY_API_KEY</code> "
             "is missing. Get a free key at "
             "<a href='https://app.tavily.com' target='_blank'>app.tavily.com</a> "
-            "and add it to your <code>.env</code> file.</div>",
+            "and add it to your <code>.env</code> file or Streamlit Cloud Secrets.</div>",
             unsafe_allow_html=True,
         )
     elif mode == "web_failed":
@@ -475,14 +491,19 @@ with st.sidebar:
         f"<div class='dm-stats'>Queries this session: <b>{st.session_state.total_queries}</b></div>",
         unsafe_allow_html=True,
     )
-    if os.getenv("TAVILY_API_KEY"):
+    if TAVILY_API_KEY:
         st.markdown("<div class='status-ok'>🟢 Web search active</div>", unsafe_allow_html=True)
     else:
         st.markdown(
             "<div class='status-err'>🔴 No Tavily key · web search off<br>"
-            "<small>Add TAVILY_API_KEY to .env</small></div>",
+            "<small>Add TAVILY_API_KEY to .env or Streamlit Secrets</small></div>",
             unsafe_allow_html=True,
         )
+
+    # ── API key debug (no key values shown) ────────────────────────────────────
+    with st.expander("🔑 API Key Status", expanded=False):
+        st.write("Groq:",   "✅ Connected" if GROQ_API_KEY   else "❌ Missing")
+        st.write("Tavily:", "✅ Enabled"   if TAVILY_API_KEY else "❌ Disabled")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
