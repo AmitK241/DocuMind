@@ -22,18 +22,29 @@ from rag import (
 
 # ── Secret resolution (local .env  →  Streamlit Cloud secrets) ────────────────
 def _get_secret(key: str) -> str | None:
-    """Check os.environ first, then st.secrets (Streamlit Cloud)."""
+    """Read a secret: os.environ first, then st.secrets (Streamlit Cloud).
+    Called at use-time so st.secrets is always fully initialised.
+    """
+    # 1. Local .env / shell environment
     value = os.getenv(key)
     if value:
         return value
+    # 2. Streamlit Cloud secrets (TOML secrets dashboard)
     try:
-        return st.secrets.get(key)
+        secrets = st.secrets
+        if key in secrets:
+            return secrets[key]
     except Exception:
-        return None
+        pass
+    return None
 
 
-GROQ_API_KEY   = _get_secret("GROQ_API_KEY")
-TAVILY_API_KEY = _get_secret("TAVILY_API_KEY")
+def _tavily_key() -> str | None:
+    return _get_secret("TAVILY_API_KEY")
+
+
+def _groq_key() -> str | None:
+    return _get_secret("GROQ_API_KEY")
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -491,7 +502,7 @@ with st.sidebar:
         f"<div class='dm-stats'>Queries this session: <b>{st.session_state.total_queries}</b></div>",
         unsafe_allow_html=True,
     )
-    if TAVILY_API_KEY:
+    if _tavily_key():
         st.markdown("<div class='status-ok'>🟢 Web search active</div>", unsafe_allow_html=True)
     else:
         st.markdown(
@@ -502,8 +513,8 @@ with st.sidebar:
 
     # ── API key debug (no key values shown) ────────────────────────────────────
     with st.expander("🔑 API Key Status", expanded=False):
-        st.write("Groq:",   "✅ Connected" if GROQ_API_KEY   else "❌ Missing")
-        st.write("Tavily:", "✅ Enabled"   if TAVILY_API_KEY else "❌ Disabled")
+        st.write("Groq:",   "✅ Connected" if _groq_key()   else "❌ Missing")
+        st.write("Tavily:", "✅ Enabled"   if _tavily_key() else "❌ Disabled")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

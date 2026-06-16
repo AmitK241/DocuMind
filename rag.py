@@ -27,14 +27,19 @@ def _get_secret(key: str) -> str | None:
     """Read a secret from the environment first, then from st.secrets.
     Works both locally (via .env / shell env) and on Streamlit Cloud.
     """
+    # 1. Local .env / shell environment
     value = os.getenv(key)
     if value:
         return value
+    # 2. Streamlit Cloud secrets
     try:
-        import streamlit as st
-        return st.secrets.get(key)
+        import streamlit as _st
+        secrets = _st.secrets
+        if key in secrets:
+            return secrets[key]
     except Exception:
-        return None
+        pass
+    return None
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 CHROMA_DIR          = "./chroma_db"
