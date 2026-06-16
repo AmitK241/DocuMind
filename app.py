@@ -4,6 +4,17 @@ app.py  ·  DocuMind — Streamlit Frontend
 DocuMind: Chat with your documents. Ask the world.
 """
 
+# ── SQLite monkey-patch (MUST be first) ───────────────────────────────────────
+# Streamlit Cloud's Ubuntu image ships with SQLite < 3.35 but chromadb requires
+# >= 3.35.  pysqlite3-binary bundles a modern SQLite; we redirect the stdlib
+# sqlite3 module to it before any chromadb/langchain import touches the DB.
+try:
+    __import__("pysqlite3")
+    import sys
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass  # local dev: system sqlite3 is recent enough
+
 import os
 import shutil
 import tempfile
@@ -470,9 +481,8 @@ with st.sidebar:
     with c1:
         if st.button("🗑️ Clear", use_container_width=True):
             st.session_state.messages = []
-            active = st.session_state.active_pdf
-            if active and active in st.session_state.pdfs:
-                st.session_state.pdfs[active]["chain"].memory.clear()
+            # LCEL chains are stateless callables — history is passed explicitly
+            # on every call, so clearing session_state.messages is sufficient.
             st.rerun()
     with c2:
         if st.button("❌ Remove", use_container_width=True):
