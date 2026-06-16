@@ -16,7 +16,7 @@
 
 <br>
 
-![DocuMind Banner](https://opengraph.githubassets.com/2567c3c8eb1935c0b87cf94cd7456e0e4175e20a067292a31fe866ae78cabdf3/AmitK241/DocuMind)
+![DocuMind Banner]([https://opengraph.githubassets.com/2567c3c8eb1935c0b87cf94cd7456e0e4175e20a067292a31fe866ae78cabdf3/AmitK241/DocuMind](https://github.com/AmitK241/DocuMind/blob/main/Screenshot%202026-06-16%20220404.png))
 
 </div>
 
