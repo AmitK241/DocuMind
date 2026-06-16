@@ -1,13 +1,6 @@
 """
 rag.py  ·  DocuMind — Core RAG Engine
-─────────────────────────────────────────────────────────────────────────────
-DocuMind: Chat with your documents. Ask the world.
-
-Routing logic:
-  PDF mode     → question is about the uploaded document
-  Web mode     → question needs real-time / post-2023 data (Tavily search)
-  General mode → stable knowledge answered directly by the LLM
-  DateTime     → current date/time answered locally via datetime.now()
+Uses modern LangChain LCEL (no ConversationalRetrievalChain) — Python 3.14 safe.
 """
 
 from __future__ import annotations
@@ -15,95 +8,86 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime
-from typing import Generator
 
 from dotenv import load_dotenv
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.runnables import RunnablePassthrough
 from langchain_groq import ChatGroq
 
 load_dotenv()
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 CHROMA_DIR          = "./chroma_db"
-EMBED_MODEL         = "all-MiniLM-L6-v2"        # runs locally, no API key
 GROQ_MODEL          = "llama-3.3-70b-versatile"
 CHUNK_SIZE          = 1000
 CHUNK_OVERLAP       = 200
 TOP_K               = 5
 RELEVANCE_THRESHOLD = 0.35
 
+try:
+    EMBED_MODEL = "all-MiniLM-L6-v2"
+    from langchain_huggingface import HuggingFaceEmbeddings as _HFE
+except ImportError:
+    from langchain_community.embeddings import HuggingFaceEmbeddings as _HFE
+
 
 # ── LLM factory ───────────────────────────────────────────────────────────────
-def get_groq_llm(temperature: float = 0.3, streaming: bool = False) -> ChatGroq:
+def get_groq_llm(temperature: float = 0.3) -> ChatGroq:
     return ChatGroq(
         model=GROQ_MODEL,
         api_key=os.getenv("GROQ_API_KEY"),
         temperature=temperature,
         max_tokens=1024,
-        streaming=streaming,
     )
 
 
 # ── Embeddings (singleton) ────────────────────────────────────────────────────
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings as _HFE
-except ImportError:
-    from langchain_community.embeddings import HuggingFaceEmbeddings as _HFE  # type: ignore
-
 _embeddings = None
 
 def _get_embeddings():
     global _embeddings
     if _embeddings is None:
         _embeddings = _HFE(
-            model_name=EMBED_MODEL,
+            model_name="all-MiniLM-L6-v2",
             model_kwargs={"device": "cpu"},
         )
     return _embeddings
 
 
-# ── PDF loading & splitting ───────────────────────────────────────────────────
+# ── PDF loading ───────────────────────────────────────────────────────────────
 def load_and_split(pdf_path: str) -> list:
-    """Load a PDF and return cleaned, page-tagged chunks."""
     loader = PyPDFLoader(pdf_path)
     pages  = loader.load()
-
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
     chunks = splitter.split_documents(pages)
-
     for chunk in chunks:
         chunk.page_content = re.sub(r"\s+", " ", chunk.page_content).strip()
-
     return [c for c in chunks if len(c.page_content) > 50]
 
 
 # ── Vector store ──────────────────────────────────────────────────────────────
-def build_vectorstore(chunks: list, collection_name: str = "default") -> Chroma:
-    import shutil, os
-    # Each PDF gets its own subdirectory to avoid collection conflicts
+def build_vectorstore(chunks: list, collection_name: str = "default"):
+    import shutil
     store_dir = os.path.join(CHROMA_DIR, collection_name)
     if os.path.exists(store_dir):
         shutil.rmtree(store_dir)
-    vectorstore = Chroma.from_documents(
+    return Chroma.from_documents(
         documents=chunks,
         embedding=_get_embeddings(),
         persist_directory=store_dir,
     )
-    return vectorstore
 
 
-def load_vectorstore(collection_name: str = "default") -> Chroma:
-    import os
+def load_vectorstore(collection_name: str = "default"):
     store_dir = os.path.join(CHROMA_DIR, collection_name)
     return Chroma(
         persist_directory=store_dir,
@@ -111,97 +95,102 @@ def load_vectorstore(collection_name: str = "default") -> Chroma:
     )
 
 
-# ── RAG chain ─────────────────────────────────────────────────────────────────
-_CONDENSE_PROMPT = PromptTemplate.from_template(
-    """Given the conversation history and a follow-up question, rephrase the
-follow-up into a standalone question.
+# ── LCEL RAG chain (replaces ConversationalRetrievalChain) ────────────────────
+_QA_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are DocuMind, a precise assistant that answers questions about documents.\n"
+     "Use ONLY the context below. If the answer is not in the context, say "
+     "'I couldn't find that in the document.' Never fabricate.\n\n"
+     "Context:\n{context}"),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
+])
 
-Chat History:
-{chat_history}
-
-Follow-up: {question}
-Standalone question:"""
-)
-
-_QA_PROMPT = PromptTemplate.from_template(
-    """You are DocuMind, a precise AI assistant that answers questions about documents.
-
-Use ONLY the context below. If the answer isn't in the context, say
-"I couldn't find that in the document." — never fabricate.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer (be concise; cite page numbers when relevant):"""
-)
+_CONDENSE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Given the conversation history and a follow-up question, "
+     "rephrase it as a standalone question. Return ONLY the question."),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
+])
 
 
-def build_rag_chain(vectorstore: Chroma) -> ConversationalRetrievalChain:
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer",
-    )
+def build_rag_chain(vectorstore):
+    """Returns a simple callable: fn(question, chat_history) -> dict"""
     retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={"k": TOP_K, "fetch_k": 20},
     )
-    return ConversationalRetrievalChain.from_llm(
-        llm=get_groq_llm(temperature=0.2),
-        retriever=retriever,
-        memory=memory,
-        return_source_documents=True,
-        condense_question_prompt=_CONDENSE_PROMPT,
-        combine_docs_chain_kwargs={"prompt": _QA_PROMPT},
-        verbose=False,
-    )
+    llm = get_groq_llm(temperature=0.2)
+
+    def _format_docs(docs):
+        return "\n\n".join(d.page_content for d in docs)
+
+    def run(question: str, chat_history: list = None):
+        chat_history = chat_history or []
+
+        # Convert history to LangChain messages
+        messages = []
+        for msg in chat_history[-6:]:
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            else:
+                messages.append(AIMessage(content=msg["content"]))
+
+        # Condense follow-up into standalone question (only if history exists)
+        standalone = question
+        if messages:
+            condense_chain = _CONDENSE_PROMPT | llm | StrOutputParser()
+            standalone = condense_chain.invoke({
+                "chat_history": messages,
+                "question": question,
+            })
+
+        # Retrieve docs
+        docs = retriever.invoke(standalone)
+
+        # Generate answer
+        qa_chain = _QA_PROMPT | llm | StrOutputParser()
+        answer = qa_chain.invoke({
+            "context":      _format_docs(docs),
+            "chat_history": messages,
+            "question":     question,
+        })
+
+        return {"answer": answer, "source_documents": docs}
+
+    # Attach vectorstore reference for relevance check
+    run.vectorstore = vectorstore
+    return run
 
 
 # ── Intent patterns ───────────────────────────────────────────────────────────
-
-# 1. PDF-directed questions — always routed to RAG regardless of similarity score
 _PDF_INTENT = re.compile(
-    r"\b("
-    r"summari[sz]e|summary|summarise|"
+    r"\b(summari[sz]e|summary|summarise|"
     r"this pdf|the pdf|given pdf|uploaded pdf|"
     r"this document|the document|this doc|the doc|"
     r"according to|based on the|from the pdf|in the pdf|"
-    r"what does (it|the pdf|the doc|this) say|"
-    r"tell me about (the|this) (pdf|document|doc)|"
-    r"explain (the|this) (pdf|document)|"
     r"key points|main points|overview|"
-    r"what is (the|this) (document|pdf) about"
-    r")\b",
+    r"what is (the|this) (document|pdf) about)\b",
     re.IGNORECASE,
 )
 
-# 2. Date/time — answered locally; never needs web search
 _DATETIME = re.compile(
-    r"\b("
-    r"what('s| is)(\s+the)?(\s+today'?s?)?\s+(date|day|time|month|year)|"
-    r"what is (the )?today|"
-    r"today'?s?\s+date|"
-    r"current\s+(date|time|day)|"
-    r"what day is (it|today)|"
+    r"\b(what('s| is)(\s+the)?(\s+today'?s?)?\s+(date|day|time|month|year)|"
+    r"what is (the )?today|today'?s?\s+date|"
+    r"current\s+(date|time|day)|what day is (it|today)|"
     r"tell me (the\s+)?(date|time|day)|"
-    r"whats? (today|the date|the time|the day)"
-    r")\b",
+    r"whats? (today|the date|the time|the day))\b",
     re.IGNORECASE,
 )
 
-# 3. Real-time questions — route to Tavily web search
 _REALTIME = re.compile(
-    r"\b("
-    r"yesterday|today|tonight|right now|just now|this morning|this evening|"
+    r"\b(yesterday|today|tonight|right now|just now|this morning|this evening|"
     r"this week|this month|this year|last night|last week|last month|"
     r"latest|recent|current|live|ongoing|happening|"
-    r"just announced|breaking|just released|out now|"
-    r"2024|2025|2026|"
+    r"just announced|breaking|just released|out now|2024|2025|2026|"
     r"news|headlines?|top stor(?:y|ies)|what(?:'s| is) happening|"
     r"what(?:'s| is) going on|updates?|developments?|"
-    r"did .{1,30} happen|has .{1,30} happened|"
     r"price of|stock price|share price|market cap|exchange rate|"
     r"how much (?:is|does|did)|worth today|"
     r"weather|temperature|forecast|will it rain|"
@@ -209,12 +198,9 @@ _REALTIME = re.compile(
     r"who(?:'s| is) the (?:current|new|latest)|"
     r"score of|result of|winner of|match result|"
     r"championship|election|verdict|"
-    r"what (?:is|are) the (?:current|latest|new|recent)|"
-    r"when (?:is|was|did|does)|"
     r"ipl|cricket|football|soccer|nba|nfl|premier league|world cup|"
     r"olympics?|tournament|"
-    r"release date|launch date|new (?:version|model|phone|update|feature)"
-    r")\b",
+    r"release date|launch date|new (?:version|model|phone|update|feature))\b",
     re.IGNORECASE,
 )
 
@@ -232,7 +218,7 @@ def _needs_web_search(q: str) -> bool:
 
 
 # ── Relevance check ───────────────────────────────────────────────────────────
-def _is_pdf_question(vectorstore: Chroma, question: str) -> tuple[bool, list]:
+def _is_pdf_question(vectorstore, question: str) -> tuple:
     if _has_pdf_intent(question):
         return True, []
     try:
@@ -243,8 +229,8 @@ def _is_pdf_question(vectorstore: Chroma, question: str) -> tuple[bool, list]:
         return True, []
 
 
-# ── Web search via Tavily ─────────────────────────────────────────────────────
-def _web_search(query: str, max_results: int = 4) -> list[dict]:
+# ── Web search ────────────────────────────────────────────────────────────────
+def _web_search(query: str, max_results: int = 4) -> list:
     key = os.getenv("TAVILY_API_KEY")
     if not key:
         return []
@@ -260,17 +246,12 @@ def _web_search(query: str, max_results: int = 4) -> list[dict]:
 
 # ── General / web answer ──────────────────────────────────────────────────────
 _SYSTEM = (
-    "You are DocuMind, a knowledgeable AI assistant with real-time web search.\n"
+    "You are DocuMind, a helpful AI assistant.\n"
     "Use provided search results (if any) and prioritise them over training data.\n"
-    "Cite sources by title when using web results. Be concise and honest.\n"
-    "Current date and time: {dt}"
+    "Be concise and honest. Current date and time: {dt}"
 )
 
-
-def _answer_general(
-    question: str,
-    chat_history: list[dict],
-) -> tuple[str, list[dict], bool]:
+def _answer_general(question: str, chat_history: list) -> tuple:
     llm           = get_groq_llm(temperature=0.4)
     web_results   = []
     web_attempted = False
@@ -283,10 +264,7 @@ def _answer_general(
     if web_results:
         search_ctx = "### Live Web Results\n"
         for i, r in enumerate(web_results, 1):
-            search_ctx += (
-                f"[{i}] {r.get('title','')} ({r.get('url','')})\n"
-                f"{r.get('content','')[:500]}\n\n"
-            )
+            search_ctx += f"[{i}] {r.get('title','')} ({r.get('url','')})\n{r.get('content','')[:500]}\n\n"
 
     history = ""
     for t in chat_history[-6:]:
@@ -295,7 +273,6 @@ def _answer_general(
 
     dt     = datetime.now().strftime("%A, %d %B %Y, %I:%M %p")
     system = _SYSTEM.format(dt=dt)
-
     prompt = (
         f"{system}\n\n"
         + (f"{search_ctx}\n" if search_ctx else "")
@@ -308,17 +285,7 @@ def _answer_general(
 
 
 # ── Primary ask ───────────────────────────────────────────────────────────────
-def ask(
-    chain: ConversationalRetrievalChain | None,
-    question: str,
-    chat_history: list[dict] | None = None,
-    vectorstore: Chroma | None = None,
-) -> dict:
-    """
-    Route the question and return:
-      answer, sources, snippets, mode, web_sources
-    mode ∈ { "pdf", "web", "web_no_key", "web_failed", "general" }
-    """
+def ask(chain, question: str, chat_history: list = None, vectorstore=None) -> dict:
     chat_history = chat_history or []
 
     is_pdf_q = False
@@ -346,8 +313,8 @@ def ask(
             "web_sources": web_results,
         }
 
-    # PDF RAG
-    result   = chain.invoke({"question": question})
+    # PDF RAG via LCEL chain
+    result   = chain(question, chat_history)
     sources, snippets, seen = [], [], set()
 
     for doc in result.get("source_documents", []):
@@ -378,8 +345,8 @@ def summarise_pdf(chunks: list) -> str:
 
     llm    = get_groq_llm(temperature=0.3)
     prompt = (
-        "You are DocuMind. Read this PDF excerpt and produce a concise summary "
-        "(5–8 bullet points) covering: main topic, key findings, and conclusions.\n\n"
+        "You are DocuMind. Produce a concise summary (5–8 bullet points) "
+        "covering: main topic, key findings, and conclusions.\n\n"
         f"Excerpt:\n{sample}\n\nSummary:"
     )
     return llm.invoke(prompt).content.strip()
